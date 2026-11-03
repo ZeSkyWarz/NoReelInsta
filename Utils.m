@@ -4,13 +4,17 @@
 @implementation SCIUtils
 
 + (id)getIvarForObj:(id)obj name:(NSString *)name {
-    id value = nil;
-    object_getInstanceVariable(obj, [name UTF8String], (void **)&value);
-    return value;
+    if (!obj || !name) return nil;
+    Ivar ivar = class_getInstanceVariable(object_getClass(obj), [name UTF8String]);
+    if (!ivar) return nil;
+    return object_getIvar(obj, ivar);
 }
 
 + (void)setIvarForObj:(id)obj name:(NSString *)name value:(id)value {
-    object_setInstanceVariable(obj, [name UTF8String], (void *)value);
+    if (!obj || !name) return;
+    Ivar ivar = class_getInstanceVariable(object_getClass(obj), [name UTF8String]);
+    if (!ivar) return;
+    object_setIvarWithStrongDefault(obj, ivar, value);
 }
 
 @end

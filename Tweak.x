@@ -1,39 +1,217 @@
 #import <substrate.h>
+#import <Foundation/Foundation.h>
+#import <Security/Security.h>
+#import <dlfcn.h>
 #import "InstagramHeaders.h"
 #import "Utils.h"
+#import "fishhook.h"
 
 // ============================================
-// NoReelInsta - Ultra-minimal Instagram tweak
-// Removes Reels tab and disables auto-scrolling
+// NoReelInsta - Fixed & Sideload-Safe Version
+// 1. Fixes Sideload Login Crash (CloudKit, Keychain, AppGroup)
+// 2. Removes Reels tab from navigation bar safely
+// 3. Disables Reels auto-scrolling / doomscrolling
 // ============================================
 
-// Preferences (always enabled, no settings)
 #define ALWAYS_HIDE_REELS_TAB YES
 #define ALWAYS_DISABLE_SCROLLING YES
 
-// Check if Reels tab should be hidden
-BOOL isReelsTabHidden(IGMainAppSurfaceIntent *surface) {
-    if ([[surface tabStringFromSurfaceIntent] isEqualToString:@"CLIPS"]) {
-        return ALWAYS_HIDE_REELS_TAB;
+// ============================================
+// PART 1: SIDELOAD LOGIN & ENTITLEMENTS FIX
+// Fixes crash on login when sideloaded via Sideloadly / AltStore
+// ============================================
+
+static NSString *sKeychainAccessGroup = nil;
+static NSURL *sFakeGroupContainerURL = nil;
+
+static void ensureDirectoryExists(NSURL *url) {
+    if (!url) return;
+    if (![url checkResourceIsReachableAndReturnError:nil]) {
+        [[NSFileManager defaultManager] createDirectoryAtURL:url
+                                 withIntermediateDirectories:YES
+                                                  attributes:nil
+                                                       error:nil];
+    }
+}
+
+static NSURL *getFakeGroupContainerURL(NSString *groupIdentifier) {
+    if (!sFakeGroupContainerURL) {
+        NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        if (docs) {
+            sFakeGroupContainerURL = [NSURL fileURLWithPath:[docs stringByAppendingPathComponent:@"FakeGroupContainers"] isDirectory:YES];
+        }
+    }
+    NSString *identifier = groupIdentifier.length > 0 ? groupIdentifier : @"default.group";
+    NSURL *fakeURL = [sFakeGroupContainerURL URLByAppendingPathComponent:identifier isDirectory:YES];
+    ensureDirectoryExists(fakeURL);
+    ensureDirectoryExists([fakeURL URLByAppendingPathComponent:@"Library" isDirectory:YES]);
+    ensureDirectoryExists([fakeURL URLByAppendingPathComponent:@"Library/Caches" isDirectory:YES]);
+    ensureDirectoryExists([fakeURL URLByAppendingPathComponent:@"Library/Preferences" isDirectory:YES]);
+    return fakeURL;
+}
+
+// Rebind SecItem* functions to replace Facebook's keychain access group with the sideloaded app's own access group
+static OSStatus (*orig_SecItemAdd)(CFDictionaryRef attributes, CFTypeRef *result);
+static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef query, CFTypeRef *result);
+static OSStatus (*orig_SecItemUpdate)(CFDictionaryRef query, CFDictionaryRef attributesToUpdate);
+static OSStatus (*orig_SecItemDelete)(CFDictionaryRef query);
+
+static CFDictionaryRef patchSecDictionary(CFDictionaryRef dict) {
+    if (!dict) return NULL;
+    if (!sKeychainAccessGroup) return CFRetain(dict);
+    NSDictionary *nsDict = (__bridge NSDictionary *)dict;
+    if (nsDict[(__bridge id)kSecAttrAccessGroup]) {
+        NSMutableDictionary *mutableDict = [nsDict mutableCopy];
+        mutableDict[(__bridge id)kSecAttrAccessGroup] = sKeychainAccessGroup;
+        return CFBridgingRetain(mutableDict);
+    }
+    return CFRetain(dict);
+}
+
+static OSStatus hooked_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
+    CFDictionaryRef patched = patchSecDictionary(attributes);
+    OSStatus status = orig_SecItemAdd(patched, result);
+    if (patched && attributes) CFRelease(patched);
+    return status;
+}
+
+static OSStatus hooked_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
+    CFDictionaryRef patched = patchSecDictionary(query);
+    OSStatus status = orig_SecItemCopyMatching(patched, result);
+    if (patched && query) CFRelease(patched);
+    return status;
+}
+
+static OSStatus hooked_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) {
+    CFDictionaryRef patchedQuery = patchSecDictionary(query);
+    CFDictionaryRef patchedAttrs = patchSecDictionary(attributesToUpdate);
+    OSStatus status = orig_SecItemUpdate(patchedQuery, patchedAttrs);
+    if (patchedQuery && query) CFRelease(patchedQuery);
+    if (patchedAttrs && attributesToUpdate) CFRelease(patchedAttrs);
+    return status;
+}
+
+static OSStatus hooked_SecItemDelete(CFDictionaryRef query) {
+    CFDictionaryRef patched = patchSecDictionary(query);
+    OSStatus status = orig_SecItemDelete(patched);
+    if (patched && query) CFRelease(patched);
+    return status;
+}
+
+static void initKeychainFix(void) {
+    NSDictionary *dummyItem = @{
+        (__bridge id)kSecClass : (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecAttrAccount : @"sideload_dummy_account",
+        (__bridge id)kSecAttrService : @"sideload_dummy_service",
+        (__bridge id)kSecReturnAttributes : @YES,
+    };
+
+    CFTypeRef result = NULL;
+    OSStatus ret = SecItemCopyMatching((__bridge CFDictionaryRef)dummyItem, &result);
+    if (ret == errSecItemNotFound) {
+        ret = SecItemAdd((__bridge CFDictionaryRef)dummyItem, &result);
+    }
+    if (ret == errSecSuccess && result) {
+        NSDictionary *resultDict = (__bridge NSDictionary *)result;
+        sKeychainAccessGroup = [resultDict[(__bridge id)kSecAttrAccessGroup] copy];
+        CFRelease(result);
+    }
+
+    struct rebinding rebindings[] = {
+        {"SecItemAdd", (void *)hooked_SecItemAdd, (void **)&orig_SecItemAdd},
+        {"SecItemCopyMatching", (void *)hooked_SecItemCopyMatching, (void **)&orig_SecItemCopyMatching},
+        {"SecItemUpdate", (void *)hooked_SecItemUpdate, (void **)&orig_SecItemUpdate},
+        {"SecItemDelete", (void *)hooked_SecItemDelete, (void **)&orig_SecItemDelete},
+    };
+    rebind_symbols(rebindings, 4);
+}
+
+// CloudKit & Sandbox Container Hooks (prevents IGCloudIDValidation SIGTRAP crash on login)
+%hook CKContainer
+- (id)_initWithContainerIdentifier:(id)arg1 {
+    return nil;
+}
+- (id)_setupWithContainerID:(id)arg1 options:(id)arg2 {
+    return nil;
+}
+%end
+
+%hook CKEntitlements
+- (id)initWithEntitlementsDict:(NSDictionary *)dict {
+    if ([dict isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *mDict = [dict mutableCopy];
+        [mDict removeObjectForKey:@"com.apple.developer.icloud-container-environment"];
+        [mDict removeObjectForKey:@"com.apple.developer.icloud-services"];
+        return %orig([mDict copy]);
+    }
+    return %orig(dict);
+}
+%end
+
+%hook NSFileManager
+- (NSURL *)containerURLForSecurityApplicationGroupIdentifier:(NSString *)groupIdentifier {
+    return getFakeGroupContainerURL(groupIdentifier);
+}
+%end
+
+%hook NSUserDefaults
+- (id)_initWithSuiteName:(NSString *)suiteName container:(NSURL *)container {
+    if ([suiteName isKindOfClass:[NSString class]] && [suiteName hasPrefix:@"group"]) {
+        NSURL *customContainer = getFakeGroupContainerURL(suiteName);
+        if (customContainer) {
+            return %orig(suiteName, customContainer);
+        }
+    }
+    return %orig(suiteName, container);
+}
+%end
+
+%hook FBSDKKeychainStore
+- (NSString *)accessGroup {
+    return sKeychainAccessGroup ?: %orig;
+}
+%end
+
+%hook FBKeychainItemController
+- (NSString *)accessGroup {
+    return sKeychainAccessGroup ?: %orig;
+}
+%end
+
+%hook UICKeyChainStore
+- (NSString *)accessGroup {
+    return sKeychainAccessGroup ?: %orig;
+}
+%end
+
+// ============================================
+// PART 2: REMOVE REELS TAB FROM NAVIGATION BAR
+// ============================================
+
+BOOL isReelsTabHidden(id surface) {
+    if (!surface) return NO;
+    if ([surface respondsToSelector:@selector(tabStringFromSurfaceIntent)]) {
+        NSString *tabStr = [surface tabStringFromSurfaceIntent];
+        if ([tabStr isKindOfClass:[NSString class]] && [tabStr isEqualToString:@"CLIPS"]) {
+            return ALWAYS_HIDE_REELS_TAB;
+        }
     }
     return NO;
 }
 
-// Filter out Reels from surfaces
 NSArray *filterSurfacesWithoutReels(NSArray *surfaces) {
-    NSMutableArray *filtered = [NSMutableArray array];
-    for (IGMainAppSurfaceIntent *surface in surfaces) {
-        if (![surface isKindOfClass:%c(IGMainAppSurfaceIntent)]) break;
+    if (![surfaces isKindOfClass:[NSArray class]]) return surfaces;
+    NSMutableArray *filtered = [NSMutableArray arrayWithCapacity:surfaces.count];
+    for (id surface in surfaces) {
         if (!isReelsTabHidden(surface)) {
             [filtered addObject:surface];
         }
     }
-    return filtered;
+    if (filtered.count == 0 && surfaces.count > 0) {
+        return surfaces;
+    }
+    return [filtered copy];
 }
-
-// ============================================
-// HOOKS 1-2: Remove Reels tab from navigation bar
-// ============================================
 
 %hook IGTabBarControllerSwipeCoordinator
 - (id)initWithSurfaces:(id)surfaces parentViewController:(id)controller enableHaptics:(_Bool)haptics launcherSet:(id)set {
@@ -41,23 +219,46 @@ NSArray *filterSurfacesWithoutReels(NSArray *surfaces) {
 }
 %end
 
-%hook IGTabBarController
-- (void)_layoutTabBar {
+static void removeReelsFromTabBarSurfaces(id self) {
     NSArray *_tabBarSurfaces = [SCIUtils getIvarForObj:self name:@"_tabBarSurfaces"];
-    [SCIUtils setIvarForObj:self name:@"_tabBarSurfaces" value:filterSurfacesWithoutReels(_tabBarSurfaces)];
+    if ([_tabBarSurfaces isKindOfClass:[NSArray class]] && _tabBarSurfaces.count > 0) {
+        NSArray *filtered = filterSurfacesWithoutReels(_tabBarSurfaces);
+        if (filtered.count != _tabBarSurfaces.count) {
+            [SCIUtils setIvarForObj:self name:@"_tabBarSurfaces" value:filtered];
+        }
+    }
+}
+
+%hook IGTabBarController
+- (void)_initializeAndConfigureBarButtonsIfNeeded {
+    removeReelsFromTabBarSurfaces(self);
+    %orig;
+    removeReelsFromTabBarSurfaces(self);
+}
+
+- (void)_createAndConfigureReelsButtonIfNeeded {
+    removeReelsFromTabBarSurfaces(self);
+    if (ALWAYS_HIDE_REELS_TAB) {
+        return;
+    }
+    %orig;
+}
+
+- (void)_layoutTabBar {
+    removeReelsFromTabBarSurfaces(self);
     %orig;
 }
 
 - (id)_buttonForTabBarSurface:(id)surface {
     if (isReelsTabHidden(surface)) {
-        return nil; // Prevent Reels tab button from appearing
+        return nil;
     }
     return %orig(surface);
 }
 %end
 
 // ============================================
-// HOOKS 3-4: Disable Reels auto-scrolling
+// PART 3: DISABLE REELS AUTO-SCROLLING
 // ============================================
 
 %hook IGUnifiedVideoCollectionView
@@ -87,122 +288,32 @@ NSArray *filterSurfacesWithoutReels(NSArray *surfaces) {
 %end
 
 // ============================================
-// HOOKS 5-14: Block TestFlight / Integrity Nag Messages
+// PART 4: SAFE TESTFLIGHT NAG SUPPRESSION
 // ============================================
 
-// 1. Block at presentation level - Check all presented view controllers
-%hook IGRootViewController
-- (void)_superPresentViewController:(UIViewController *)viewController animated:(BOOL)animated completion:(id)completion {
-    NSString *className = NSStringFromClass([viewController class]);
-    // Check if this is a TestFlight/Integrity nag controller
-    if ([className containsString:@"TestFlight"] || [className containsString:@"Nag"] || [className containsString:@"Integrity"]) {
-        return; // Block presentation
-    }
-    %orig(viewController, animated, completion);
-}
-%end
-
-// 2. Block UIViewController presentViewController as fallback
-%hook UIViewController
-- (void)presentViewController:(UIViewController *)viewControllerToPresent animated:(BOOL)flag completion:(id)completion {
-    NSString *className = NSStringFromClass([viewControllerToPresent class]);
-    // Block TestFlight/Integrity nags
-    if ([className containsString:@"TestFlight"] || [className containsString:@"Nag"] || [className containsString:@"Integrity"] || [className containsString:@"UpdateNudge"]) {
-        return; // Block presentation
-    }
-    %orig(viewControllerToPresent, flag, completion);
-}
-%end
-
-// 3. Block UIApplication openURL for TestFlight links
-%hook UIApplication
-- (BOOL)openURL:(NSURL *)url {
-    NSString *urlString = [url absoluteString];
-    // Block TestFlight app store and beta links
-    if ([urlString containsString:@"testflight"] || [urlString containsString:@"itms-beta://"] || [urlString containsString:@"apps.apple.com/us/app/testflight"]) {
-        return NO; // Block TestFlight URL opening
-    }
-    return %orig(url);
-}
-%end
-
-// 4. Block IGCoreRootTestFlightNagPlugin (BLOCK AT SOURCE)
 %hook IGCoreRootTestFlightNagPlugin
-- (void)showTestFlightNagIfNeeded {
-    return;
-}
-- (void)checkForTestFlightNag {
-    return;
-}
-- (void)presentTestFlightUpdateNag {
-    return;
-}
-- (void)presentTestFlightUpdateNagWithTitle:(NSString *)title message:(NSString *)message {
-    return;
-}
+- (void)showTestFlightNagIfNeeded { return; }
+- (void)checkForTestFlightNag { return; }
+- (void)presentTestFlightUpdateNag { return; }
+- (void)presentTestFlightUpdateNagWithTitle:(NSString *)title message:(NSString *)message { return; }
 %end
 
-// 5. Block Swift nested class: IGCoreRootTestFlightNagPlugin_TestFlightUpdateNudgeViewController
-%hook IGCoreRootTestFlightNagPlugin_TestFlightUpdateNudgeViewController
-- (instancetype)initWithNibName:(NSString *)nibNameOrNil bundle:(NSBundle *)nibBundleOrNil {
-    return nil; // Prevent creation
-}
-- (void)viewDidLoad {
-    %orig;
-    [self dismissViewControllerAnimated:NO completion:^{}];
-}
-- (void)viewDidAppear:(BOOL)animated {
-    %orig;
-    [self dismissViewControllerAnimated:NO completion:^{}];
-}
-%end
-
-// 6. Block alternative name (Swift mangled without parent)
-%hook TestFlightUpdateNudgeViewController
-- (instancetype)initWithNibName:(NSString *)nibNameOrNil bundle:(NSBundle *)nibBundleOrNil {
-    return nil; // Prevent creation
-}
-- (void)viewDidLoad {
-    %orig;
-    [self dismissViewControllerAnimated:NO completion:^{}];
-}
-- (void)viewDidAppear:(BOOL)animated {
-    %orig;
-    [self dismissViewControllerAnimated:NO completion:^{}];
-}
-%end
-
-// 7. Block IGTestFlightNagController
 %hook IGTestFlightNagController
-- (void)presentUpdateNag {
-    return;
-}
-- (void)presentNagWithTitle:(NSString *)title message:(NSString *)message {
-    return;
-}
+- (void)presentUpdateNag { return; }
+- (void)presentNagWithTitle:(NSString *)title message:(NSString *)message { return; }
 %end
 
-// 8. Block IGTestFlightUpdateNagController
 %hook IGTestFlightUpdateNagController
-- (void)presentNag {
-    return;
-}
-- (void)showUpdateNag {
-    return;
-}
+- (void)presentNag { return; }
+- (void)showUpdateNag { return; }
 %end
 
-// 9. Block Integrity Decision Dialog
-%hook _InReviewIntegrityDecisionDialogController
-- (void)viewDidLoad {
-    %orig;
-    [self dismissViewControllerAnimated:NO completion:^{}];
+%ctor {
+    // Ensure InstagramAppCoreFramework is loaded if present
+    NSString *coreFwPath = [[NSBundle mainBundle].bundlePath stringByAppendingPathComponent:@"Frameworks/InstagramAppCoreFramework.framework/InstagramAppCoreFramework"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:coreFwPath]) {
+        dlopen([coreFwPath UTF8String], RTLD_NOW);
+    }
+    initKeychainFix();
+    %init;
 }
-%end
-
-// 10. Block Browser Integrity Controller
-%hook _browserIntegrityController
-- (void)showIntegrityWarning {
-    return;
-}
-%end

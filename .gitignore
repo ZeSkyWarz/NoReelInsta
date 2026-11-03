@@ -1,6 +1,8 @@
 .theos/
+packages/
 *.dylib
 *.ipa
+*.deb
 .DS_Store
 build/
 obj/
