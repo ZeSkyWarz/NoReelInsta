@@ -2,11 +2,6 @@
 #include <objc/NSObject.h>
 #import <UIKit/UIKit.h>
 
-// Root view controller for presenting nag messages
-@interface IGRootViewController : UIViewController
-- (void)_superPresentViewController:(UIViewController *)viewController animated:(BOOL)animated completion:(id)completion;
-@end
-
 // Classes for Reels tab removal
 @interface IGMainAppSurfaceIntent : NSObject
 - (NSString *)tabStringFromSurfaceIntent;
@@ -27,17 +22,7 @@
 - (void)setIsEnabled:(BOOL)enabled;
 @end
 
-// Classes for blocking TestFlight/Integrity nag messages
-// Swift nested class: IGCoreRootTestFlightNagPlugin.TestFlightUpdateNudgeViewController
-@interface IGCoreRootTestFlightNagPlugin_TestFlightUpdateNudgeViewController : UIViewController
-- (void)dismissViewControllerAnimated:(BOOL)flag completion:(void (^)(void))completion;
-@end
-
-// Alternative Swift mangled names (suffixes can change between app versions)
-@interface TestFlightUpdateNudgeViewController : UIViewController
-- (void)dismissViewControllerAnimated:(BOOL)flag completion:(void (^)(void))completion;
-@end
-
+// Safe TestFlight nag suppression (only specific plugin classes)
 @interface IGTestFlightNagController : NSObject
 - (void)presentUpdateNag;
 - (void)presentNagWithTitle:(NSString *)title message:(NSString *)message;
@@ -53,12 +38,4 @@
 @interface IGTestFlightUpdateNagController : NSObject
 - (void)presentNag;
 - (void)showUpdateNag;
-@end
-
-@interface _InReviewIntegrityDecisionDialogController : UIViewController
-- (void)dismissViewControllerAnimated:(BOOL)flag completion:(void (^)(void))completion;
-@end
-
-@interface _browserIntegrityController : NSObject
-- (void)showIntegrityWarning;
 @end
